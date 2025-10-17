@@ -303,3 +303,135 @@ Notes:
 - If you prefer to keep the bucket private, pass -NoPublic and serve it behind a CDN or use signed URLs.
 - Any static host will work (Firebase Hosting, Cloud Run static, Vercel, Netlify). Just ensure VITE_API_URL points at your API.
 - CORS is already enabled on the backend. If you need to restrict origins, edit CORS(app, ...) in main.py.
+
+
+---
+
+## Optional: Direct RAG over your GCS bucket using Pinecone (no Discovery Engine required)
+
+This repository now includes an optional Retrieval-Augmented Generation (RAG) path that lets the chatbot read files directly from a Google Cloud Storage (GCS) bucket, index them into a Pinecone vector database, and answer questions grounded in those files.
+
+Key endpoints:
+- POST /ingest/gcs — Index text-like files from your GCS bucket into Pinecone
+- POST /chat/rag — Ask questions that retrieve from Pinecone and synthesize an answer with Gemini
+
+When to use this:
+- You want fast, incremental control of indexing specific objects from a bucket
+- You prefer Pinecone for vector search
+- You may not want to set up Vertex AI Search (Discovery Engine) yet, or you want both options side-by-side
+
+Environment variables (in addition to the ones above):
+- GOOGLE_API_KEY: API key for Google Generative AI (Gemini + Embeddings)
+- PINECONE_API_KEY: Pinecone API key
+- PINECONE_INDEX_NAME (default: utahai-files)
+- PINECONE_CLOUD (default: aws) and PINECONE_REGION (default: us-east-1) used for creating a serverless index if missing
+- EMBED_MODEL (default: text-embedding-004) and EMBED_DIM (default: 768)
+- RAG_MODEL (default: gemini-1.5-flash)
+- GCS_BUCKET_NAME: exact bucket name (preferred)
+- GCS_BUCKET_HINT (default: "gchat utahai bucket 1"): fuzzy hint to auto-resolve a bucket name if GCS_BUCKET_NAME is unset
+- GCS_PATH_PREFIX: optional folder/prefix inside the bucket
+- GCS_ALLOWED_EXTS (default: txt,md,log,csv,json,html)
+- GCS_MAX_FILE_SIZE_MB (default: 5)
+
+Google Cloud credentials for GCS:
+- Locally, set GOOGLE_APPLICATION_CREDENTIALS to a service account JSON file with storage.objects.get/list on the target bucket.
+- In Cloud Run/GKE/Compute Engine, rely on Application Default Credentials (ADC) via the runtime service account.
+
+Install dependencies (local dev):
+
+  pip install -r requirements.txt
+
+Ingest from your bucket (dry-run first):
+
+  curl -X POST "http://localhost:8080/ingest/gcs" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "hint": "gchat utahai bucket 1",
+      "prefix": "",
+      "dry_run": true,
+      "max_files": 10
+    }'
+
+If the response shows the right files, run actual ingestion (removes dry_run):
+
+  curl -X POST "http://localhost:8080/ingest/gcs" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "hint": "gchat utahai bucket 1",
+      "prefix": "",
+      "dry_run": false
+    }'
+
+Ask questions over your indexed files:
+
+  curl -X POST "http://localhost:8080/chat/rag" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "Summarize the main points in the project notes",
+      "top_k": 5
+    }'
+
+Notes and limitations:
+- The GCS ingestion path indexes text-like files by extension filter. PDFs/Docs aren’t parsed here; to index those, convert to text first or continue using Vertex AI Search which supports rich doc parsing.
+- Each Pinecone record stores a text chunk (truncated to ~1800 chars) and metadata including the GCS source URI. Metadata size limits apply.
+- Error handling is best-effort; the API returns a list of errors in the ingestion result if any items failed.
+- You can safely use both /chat and /chat/rag in the same deployment. /chat uses Vertex AI Search; /chat/rag uses Pinecone.
+
+
+---
+
+## Agentic RAG and multimodal messaging (new)
+
+This API now supports an agentic RAG flow and multimodal inputs (images/audio/video) when using Gemini.
+
+New endpoints:
+- POST /chat/rag — now accepts optional attachments to include media in the prompt
+- POST /chat/agentic — planner–executor loop with simple tools and citations
+
+Multimodal attachments
+- Request body field: attachments (array)
+- Each attachment may be either a GCS URI or an HTTP URL:
+  - { "gcs_uri": "gs://YOUR_BUCKET/path/to/image.png", "mime"?: "image/png" }
+  - { "url": "https://example.com/image.jpg" }
+- Only image/*, audio/*, and video/* are passed to the model; others are ignored.
+- Size limits (configurable via env):
+  - GCS_MEDIA_MAX_FILE_SIZE_MB (default: 15)
+  - HTTP_MEDIA_MAX_FILE_SIZE_MB (default: 15)
+
+Example — RAG with image context:
+
+  curl -X POST "http://localhost:8080/chat/rag" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "Summarize the notes and interpret the chart",
+      "top_k": 5,
+      "attachments": [
+        {"gcs_uri": "gs://utahai_bucket-1/plots/weekly.png"}
+      ]
+    }'
+
+Agentic RAG (/chat/agentic)
+- The agent plans up to max_steps (default 3) with a limited set of tools:
+  - vector_retrieve: query Pinecone over your GCS-ingested chunks
+  - vertex_search: query Vertex AI Search (Discovery Engine)
+  - read_gcs_object: fetch and read a text object from GCS
+  - rng: generate a random integer (demonstrates tool use; can be handy for sampling)
+- The agent returns a final answer with citations and a trace of steps.
+
+Example — Agentic query with media:
+
+  curl -X POST "http://localhost:8080/chat/agentic" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "query": "What are the key takeaways from the roadmap? If not enough context, look up more.",
+      "top_k": 5,
+      "max_steps": 3,
+      "attachments": [
+        {"url": "https://example.com/diagram.png"}
+      ]
+    }'
+
+Notes
+- All multimodal and agentic features are optional. If GOOGLE_API_KEY is not set or libraries are missing, the API falls back gracefully.
+- Ensure your service account has read access to the GCS objects you attach (for private buckets). For public files, HTTP URLs work without credentials.
+- Attachments are not stored; they are fetched at request time and streamed to the model.
